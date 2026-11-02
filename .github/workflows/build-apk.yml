@@ -1,0 +1,106 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore: [ 'index.html', 'docs/**', '**.md' ]     # uploading only the admin panel does not rebuild the APK
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: "4.3"
+
+jobs:
+  build-apk:
+    name: Export debug APK
+    runs-on: ubuntu-22.04
+    container:
+      image: barichello/godot-ci:4.3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unpack uploaded zip parts
+        run: |
+          # the game is uploaded as lemov-*.zip parts (alphabetical order, later parts overwrite earlier ones)
+          ls -la
+          for z in $(ls lemov-*.zip 2>/dev/null | sort); do
+            echo "unpacking $z"
+            if command -v unzip >/dev/null 2>&1; then unzip -o -q "$z"; else jar xf "$z"; fi
+          done
+          ls
+          du -sh assets/cars 2>/dev/null || true
+
+      - name: Apply server.json
+        run: |
+          # optional: server.json (made by the admin panel) in the repo root overrides data/server.json
+          if [ -f server.json ]; then mkdir -p data; cp server.json data/server.json; echo "server.json applied"; fi
+
+      - name: Install export templates
+        run: |
+          mkdir -p ~/.local/share/godot/export_templates
+          if [ -d /root/.local/share/godot/export_templates/${GODOT_VERSION}.stable ]; then
+            cp -r /root/.local/share/godot/export_templates/${GODOT_VERSION}.stable ~/.local/share/godot/export_templates/ || true
+          fi
+          ls ~/.local/share/godot/export_templates/
+
+      - name: Create debug keystore and editor settings
+        run: |
+          mkdir -p ~/.config/godot
+          KS=/root/debug.keystore
+          if [ ! -f "$KS" ]; then
+            keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android \
+              -keystore "$KS" -storepass android \
+              -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+          fi
+          SDK=""
+          for p in /usr/lib/android-sdk /opt/android-sdk /usr/local/lib/android/sdk "$ANDROID_HOME" "$ANDROID_SDK_ROOT"; do
+            if [ -n "$p" ] && [ -d "$p" ]; then SDK="$p"; break; fi
+          done
+          echo "Android SDK: $SDK"
+          JAVA=$(dirname $(dirname $(readlink -f $(which javac))))
+          echo "Java: $JAVA"
+          cat > ~/.config/godot/editor_settings-4.3.tres <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$SDK"
+          export/android/java_sdk_path = "$JAVA"
+          export/android/debug_keystore = "$KS"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          export/android/force_system_user = false
+          export/android/shutdown_adb_on_exit = true
+          EOF
+          sed -i 's/^          //' ~/.config/godot/editor_settings-4.3.tres
+          cat ~/.config/godot/editor_settings-4.3.tres
+
+      - name: Import project resources
+        run: |
+          godot --headless --verbose --import || true
+          godot --headless --verbose --import || true
+
+      - name: Export APK
+        run: |
+          mkdir -p build
+          godot --headless --verbose --export-debug "Android" build/Lemov.apk
+          ls -la build
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lemov-apk
+          path: build/Lemov.apk
+          if-no-files-found: error
+
+      - name: Publish APK to the "latest" release (direct download link)
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Lemov latest build
+          body: Latest APK built from the repository.
+          files: build/Lemov.apk
+          overwrite_files: true
